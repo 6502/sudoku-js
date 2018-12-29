@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style type="text/css">
+    </style>
+  </head>
+  <body>
+    <div style="display:none">
+        Blur constant: <input id="blur_constant" value="0.8"><br>
+        Blur threshold: <input id="blur_threshold" value="0.95"><br>
+        Show binarized: <input type="checkbox" id="show_binarized"><br>
+        Show digits match: <input type="checkbox" id="show_debug"><br>
+        <input id="run" type="button" value="Start"><br>
+    </div>
+    <canvas id="canvas"></canvas>
+    <div id="debug"></id>
+    <script>;
+
+let canvas = document.getElementById("canvas"),
+    show_binarized = document.getElementById("show_binarized"),
+    show_debug = document.getElementById("show_debug"),
+    blur_constant = document.getElementById("blur_constant"),
+    blur_threshold = document.getElementById("blur_threshold"),
+    run = document.getElementById("run"),
+    debug = document.getElementById("debug"),
+    buffer = null, bufctx, fp_buf = null, base_buf = null, bin_buf,
+    last_frame = null, fsz = 50, fref = fontref(fsz);
+
+let video = document.createElement("video");
+video.autoplay = true;
+navigator.mediaDevices.getUserMedia({video:{facingMode: "environment", width:800, height:600}}).
+    then(stream => video.srcObject = stream);
+
+function fontref(sz) {
+    let font = document.createElement("canvas"),
+        ctx = font.getContext("2d");
+    font.width = sz*9;
+    font.height = sz;
+    ctx.fillStyle = "#FFF";
+    ctx.fillRect(0, 0, sz*9, sz);
+    ctx.font = sz + "px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#000";
+    for (let i=0; i<9; i++) {
+        ctx.fillText(i+1, (i+0.5)*sz, sz*0.5);
+    }
+    //document.body.appendChild(font);
+    let d = ctx.getImageData(0, 0, sz*9, sz).data;
+    let res = {data: d, box:[]};
+    for (let i=0; i<9; i++) {
+        let x0=sz*9, y0=sz, x1=0, y1=0;
+        for (let y=0; y<sz; y++) {
+            for (let x=i*sz; x<(i+1)*sz; x++) {
+                if (d[(y*sz*9+x)*4 + 1] < 128) {
+                    d[(y*sz*9+x)*4 + 1] = 0;
+                    x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+                    y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+                } else {
+                    d[(y*sz*9+x)*4 + 1] = 255;
+                }
+            }
+        }
+        x0 -= 2; y0 -= 2; x1 += 2; y1 += 2;
+        res.box.push({x0, y0, x1, y1});
+        /*
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y0);
+        ctx.lineTo(x1, y1);
+        ctx.lineTo(x0, y1);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(255,0,0,0.25)";
+        ctx.fill();
+        */
+    }
+    return res;
+}
+
+function processFrame() {
+    let ct = video.currentTime;
+    if (ct !== last_frame && video.videoWidth !== 0) {
+        last_frame = ct;
+        let w = video.videoWidth, h = video.videoHeight;
+        if (buffer === null) {
+            buffer = document.createElement("canvas");
+            buffer.width = w; buffer.height = h;
+            bufctx = buffer.getContext("2d");
+            fp_buf = new Float64Array(w*h);
+            base_buf = new Float64Array(w*h);
+            bin_buf = new Uint8Array(w*h);
+        }
+        bufctx.drawImage(video, 0, 0);
+        let id = bufctx.getImageData(0, 0, w, h),
+            d = id.data;
+        for (let i=0,n=w*h; i<n; i++) {
+            base_buf[i] = fp_buf[i] = d[i*4+1];
+        }
+
+        let showdeb = show_debug.checked;
+        debug.style.display = showdeb ? "block" : "none";
+        debug.innerHTML = "";
+
+        // blur
+        let bk = +blur_constant.value, bk1 = 1-bk;
+        for (let y=0; y<h; y++) {
+            let a = y*w;
+            for (let x=1; x<w; x++) base_buf[a+x] = base_buf[a+x-1]*bk + base_buf[a+x]*bk1;
+            for (let x=w-2; x>=0; x--) base_buf[a+x] = base_buf[a+x+1]*bk + base_buf[a+x]*bk1;
+        }
+        for (let x=0; x<w; x++) {
+            for (let y=1; y<h; y++) base_buf[x+y*w] = base_buf[x+(y-1)*w]*bk + base_buf[x+y*w]*bk1;
+            for (let y=h-2; y>=0; y--) base_buf[x+y*w] = base_buf[x+(y+1)*w]*bk + base_buf[x+y*w]*bk1;
+        }
+
+        // binarization
+        let t = +blur_threshold.value;
+        for (let i=0,n=w*h; i<n; i++) {
+            bin_buf[i] = fp_buf[i] > base_buf[i]*t ? 255 : 0;
+        }
+
+        // blob detect
+        let blobs = [], largest;
+        for (let y=0; y<h; y++) {
+            for (let x=0; x<w; x++) {
+                if (bin_buf[y*w+x] === 0) {
+                    let p = {x, y}, a = [p], res = [p], xa=x, ya=y, xb=x+1, yb=y+1;
+                    bin_buf[y*w+x] = 1;
+                    while (a.length) {
+                        let na = [];
+                        for (let {x, y} of a) {
+                            let x0 = Math.max(0, x-1), y0 = Math.max(0, y-1),
+                                x1 = Math.min(w, x+2), y1 = Math.min(h, y+2);
+                            for (let yy=y0; yy<y1; yy++) {
+                                for (let xx=x0; xx<x1; xx++) {
+                                    if (bin_buf[yy*w+xx] == 0) {
+                                        let p = {x:xx, y:yy};
+                                        res.push(p);
+                                        na.push(p);
+                                        bin_buf[yy*w+xx] = 1;
+                                        xa = Math.min(xa, xx); ya = Math.min(ya, yy);
+                                        xb = Math.max(xb, xx+1); yb = Math.max(yb, yy+1);
+                                    }
+                                }
+                            }
+                        }
+                        a = na;
+                    }
+                    if (xa > 0 && xb < w && ya > 0 && yb < h && res.length > 6*6) {
+                        let area = (xb - xa)*(yb - ya);
+                        blobs.push({pts: res, x0:xa, y0:ya, x1:xb, y1:yb, area:area});
+                        if (largest === undefined || largest.area < area) largest = blobs[blobs.length-1];
+                    }
+                }
+            }
+        }
+
+        canvas.width = w; canvas.height = h;
+
+        let ctx = canvas.getContext("2d");
+        if (show_binarized.checked) {
+            for (let i=0,n=w*h; i<n; i++) {
+                d[i*4] = d[i*4+1] = d[i*4+2] = bin_buf[i];
+            }
+        }
+        ctx.putImageData(id, 0, 0);
+
+        if (largest) {
+            // Corners detect
+            function farthest(xx, yy) {
+                let bd = 0, bp = undefined;
+                for (let p of largest.pts) {
+                    let d = (p.x - xx)**2 + (p.y - yy)**2;
+                    if (d > bd) { bd = d; bp = p; }
+                }
+                return bp;
+            }
+
+            function farthest2(xa, ya, xb, yb) {
+                let dx = xb - xa, dy = yb - ya, d2 = dx**2 + dy**2;
+                let bd = 0, bp = undefined;
+                for (let p of largest.pts) {
+                    let t = ((p.x - xa)*dx + (p.y - ya)*dy)/d2,
+                        xx = xa + t*dx, yy = ya + t*dy,
+                        d = (p.x - xx)**2 + (p.y - yy)**2;
+                    if (d > bd) { bd = d; bp = p; }
+                }
+                return bp;
+            }
+
+            function dist(a, b) {
+                return ((a.x - b.x)**2 + (a.y - b.y)**2)**0.5;
+            }
+
+            let A = farthest((largest.x0 + largest.x1)/2, (largest.y0 + largest.y1)/2),
+                D = farthest(A.x, A.y),
+                B = farthest2(A.x, A.y, D.x, D.y),
+                C = farthest(B.x, B.y);
+            if (A.y > D.y) { let t=A; A=D; D=t; }
+            if (B.y > C.y) { let t=B; B=C; C=t; }
+            if (A.x > B.x) { let t=A; A=B; B=t; t=C; C=D; D=t; }
+            let AB = dist(A, B), BD = dist(B, D), DC = dist(D, C), CA = dist(C, A),
+                mn = Math.min(AB, BD, DC, CA), mx = Math.max(AB, BD, DC, CA),
+                D1 = dist(A, C), D2 = dist(B, D);
+            if (mn > mx*0.8 && Math.abs(A.x - C.x) < mn*0.1 && D1*1.1 > D2 && D2*1.1 > D1) {
+                ctx.beginPath();
+                ctx.moveTo(A.x, A.y);
+                ctx.lineTo(B.x, B.y);
+                ctx.lineTo(D.x, D.y);
+                ctx.lineTo(C.x, C.y);
+                ctx.closePath();
+                ctx.fillStyle = "rgba(0, 255, 0, 0.25)";
+                ctx.fill();
+                let sz = (mn + mx)/2/9;
+                let cc = [];
+
+                function project(i, j) {
+                    let s = i/9, t = j/9;
+                    return {x: (A.x*(1-t) + B.x*t)*(1-s) + (C.x*(1-t) + D.x*t)*s,
+                            y: (A.y*(1-t) + B.y*t)*(1-s) + (C.y*(1-t) + D.y*t)*s};
+                }
+
+                let count = 0, data = new Uint8Array(9*9*2);
+                for (let i=0; i<9; i++) {
+                    for (let j=0; j<9; j++) {
+                        let {x, y} = project(i+0.5, j+0.5);
+                        let {x:xa, y:ya} = project(i-0.05, j-0.05);
+                        let {x:xb, y:yb} = project(i-0.05, j+1.05);
+                        let {x:xc, y:yc} = project(i+1.05, j-0.05);
+                        let {x:xd, y:yd} = project(i+1.05, j+1.05);
+                        let bb = (xb - xa)*0.125
+                        for (let b of blobs) {
+                            if (x >= b.x0-bb && y >= b.y0-bb && x < b.x1+bb && y < b.y1+bb &&
+                                b.x0 > xa && b.y0 > ya && b.x1 < xd && b.y1 < yd) {
+                                ctx.beginPath();
+                                ctx.moveTo(xa, ya);
+                                ctx.lineTo(xb, yb);
+                                ctx.lineTo(xd, yd);
+                                ctx.lineTo(xc, yc);
+                                ctx.closePath();
+                                ctx.fillStyle = "rgba(255, 0, 0, 0.25)";
+                                ctx.fill();
+                                let bd = undefined, be = undefined,
+                                    bxx = (b.x0 + b.x1)/2, byy = (b.y0 + b.y1)/2,
+                                    debug_row = showdeb ? debug.appendChild(document.createElement("div")) : undefined;
+                                for (let di=0; di<9; di++) {
+                                    let berr = undefined, bck = undefined;
+                                    for (let oy=-2; oy<=2; oy++) {
+                                        for (let ox=-2; ox<=2; ox++) {
+                                            let d = fref.box[di], err = 0;
+                                            let sf = (d.y1 - d.y0)/(b.y1 - b.y0),
+                                                dxx = (d.x0 + d.x1)/2 + ox, dyy = (d.y0 + d.y1)/2 + oy;
+
+                                            let ck = showdeb ? document.createElement("canvas") : undefined;
+                                            if (showdeb) {
+                                                ck.width = b.x1 - b.x0 + 4;
+                                                ck.height = b.y1 - b.y0 + 4;
+                                            }
+                                            let ckctx = showdeb ? ck.getContext("2d") : undefined;
+                                            let ckid = showdeb ? ckctx.getImageData(0, 0, ck.width, ck.height) : undefined;
+
+                                            for (let y=b.y0-2; y<b.y1+2; y++) {
+                                                let dy = Math.max(0, Math.min(fsz-1, 0|((y-byy)*sf+dyy)));
+                                                for (let x=b.x0-2; x<b.x1+2; x++) {
+                                                    let dx = Math.max(0, Math.min(fsz*9-1, 0|((x-bxx)*sf+dxx)));
+                                                    let v0 = bin_buf[y*w+x], v1 = fref.data[(dy*fsz*9 + dx)*4+1];
+                                                    let e = v1 - v0;
+                                                    err += e*e;
+                                                    if (showdeb) {
+                                                        ckid.data[((y-b.y0+2)*(b.x1-b.x0+4)+(x-b.x0+2))*4] = 255-v0;
+                                                        ckid.data[((y-b.y0+2)*(b.x1-b.x0+4)+(x-b.x0+2))*4+1] = 255-v1;
+                                                        ckid.data[((y-b.y0+2)*(b.x1-b.x0+4)+(x-b.x0+2))*4+2] = 0;
+                                                        ckid.data[((y-b.y0+2)*(b.x1-b.x0+4)+(x-b.x0+2))*4+3] = 255;
+                                                    }
+                                                }
+                                            }
+                                            if (berr === undefined || err < berr) {
+                                                berr = err;
+                                                if (showdeb) {
+                                                    bck = ck;
+                                                    ckctx.putImageData(ckid, 0, 0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (showdeb) {
+                                        bck.style.width = bck.width*2 + "px";
+                                        bck.style.height = bck.height*2 + "px";
+                                        bck.style.margin = "4px";
+                                        debug_row.appendChild(bck);
+                                    }
+
+                                    if (bd === undefined || berr < be) {
+                                        be = berr; bd = di;
+                                    }
+                                }
+                                ctx.font = (d.y1 - d.y0)*0.8 + "px sans-serif";
+                                ctx.textAlign = "center";
+                                ctx.textBaseline = "middle";
+                                ctx.fillStyle = "#FFFF00";
+                                ctx.fillText(bd+1, xa+8, ya+8);
+                                data[i*9+j] = data[9*9+i*9+j] = bd+1;
+                            }
+                        }
+                    }
+                }
+                let used = new Uint16Array(9+9+9), ok = true;
+
+                for (let i=0; i<9; i++) {
+                    for (let j=0; j<9; j++) {
+                        if (data[i*9+j]) {
+                            let m = 1 << (data[i*9+j] - 1), b = (i/3|0)*3 + (j/3|0);
+                            if ((used[i] | used[9+j] | used[18+b]) & m) ok = false;
+                            used[i] |= m;
+                            used[9+j] |= m;
+                            used[18+b] |= m;
+                        }
+                    }
+                }
+
+                function play(i, j, d) {
+                    let m = 1<<(d-1), b = (i/3|0)*3 + (j/3|0);
+                    data[i*9+j] ^= d;
+                    used[i] ^= m;
+                    used[9+j] ^= m;
+                    used[18+b] ^= m;
+                }
+
+                function solver() {
+                    let choice = -1;
+                    for (let i=0; i<9; i++) {
+                        for (let j=0; j<9; j++) {
+                            if (data[i*9+j] == 0) {
+                                let b = (i/3|0)*3 + (j/3|0);
+                                let a = 511 - (used[i] | used[9+j] | used[18+b]);
+                                if (a == 0) return false;
+                                if ((a & (a-1)) == 0) {
+                                    let d = 1;
+                                    while (a>1) {
+                                        d++;
+                                        a = a>>1;
+                                    }
+                                    play(i, j, d);
+                                    let s = solver();
+                                    if (!s) play(i, j, d);
+                                    return s;
+                                } else {
+                                    choice = i*9+j;
+                                }
+                            }
+                        }
+                    }
+                    if (choice == -1) return true;
+                    let i = choice/9|0, j = choice%9;
+                    let b = (i/3|0)*3 + (j/3|0);
+                    let u = used[i] | used[9+j] | used[18+b];
+                    for (let d=1; d<=9; d++) {
+                        if (((1<<(d-1)) & u) == 0) {
+                            play(i, j, d);
+                            let s = solver();
+                            if (s) return true;
+                            play(i, j, d);
+                        }
+                    }
+                    return false;
+                }
+
+                if (ok) ok = solver();
+
+                if (ok) {
+                    for (let i=0; i<9; i++) {
+                        for (let j=0; j<9; j++) {
+                            if (data[i*9+j] != data[9*9+i*9+j]) {
+                                let {x, y} = project(i+0.5, j+0.5);
+                                let {x:xa, y:ya} = project(i, j);
+                                let {x:xb, y:yb} = project(i, j+1);
+                                let {x:xc, y:yc} = project(i+1, j);
+                                let {x:xd, y:yd} = project(i+1, j+1);
+                                ctx.font = (yc-ya)*0.8 + "px sans-serif";
+                                ctx.textAlign = "center";
+                                ctx.textBaseline = "middle";
+                                ctx.fillStyle = "#FF00FF";
+                                ctx.fillText(data[i*9+j], x, y);
+                            }
+                        }
+                    }
+                    run.onclick();
+                }
+            }
+        }
+    }
+}
+
+let run_timer = undefined;
+run.onclick = ()=>{
+    if (run_timer === undefined) {
+        run_timer = setInterval(processFrame, 10);
+        run.value = "Stop";
+    } else {
+        clearInterval(run_timer);
+        run.value = "Start";
+        run_timer = undefined;
+    }
+};
+
+run.onclick();
+
+    </script>
+  </body>
+</html>
